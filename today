@@ -1,0 +1,282 @@
+Production-Ready Solution for Cluster Naming and Embedding Storage
+
+I understand now! You need the JSON file for manual editing of cluster names to match industrial nomenclature, while also needing an efficient way to store embeddings. Let me provide a comprehensive solution that addresses both requirements.
+
+Revised Approach
+
+1. Keep your JSON approach for manual cluster name editing
+2. Use S3 for embedding storage to reduce deployment package size
+3. Implement efficient caching for production performance
+
+Implementation Plan
+
+Folder Structure
+
+```
+Sample_deployment/
+    deployment_package/
+        Fin/
+            model.pkl
+            cluster_keywords.json  # For manual editing of cluster names
+            metadata.json          # Contains S3 path to embeddings and other info
+        Stdp/
+            model.pkl
+            cluster_keywords.json
+            metadata.json
+        ... (other material types)
+    inference.py
+    requirements.txt
+
+training_models/
+    Fin/
+        Fin_training.ipynb
+    Stdp/
+        Stdp_training.ipynb
+    ... (other material types)
+
+# Embeddings stored in S3
+s3://your-bucket-name/embeddings/
+    Fin/
+        embeddings_compressed.npz
+    Stdp/
+        embeddings_compressed.npz
+    ... (other material types)
+```
+
+Updated Training Code
+
+```python
+# In your training notebook (e.g., Fin_training.ipynb)
+import json
+import boto3
+import numpy as np
+from io import BytesIO
+import bz2
+
+def save_cluster_keywords(data, material_type):
+    """Save cluster numbers and proposed keywords to JSON for manual editing"""
+    # Create a dictionary to store cluster number and proposed keyword
+    cluster_keywords = data[['cluster', 'proposedkey']].drop_duplicates().set_index('cluster')['proposedkey'].to_dict()
+    
+    # Define the output JSON file name
+    output_filename = f'{material_type}_cluster_keywords.json'
+    
+    # Save the dictionary to a JSON file
+    with open(output_filename, 'w') as f:
+        json.dump(cluster_keywords, f, indent=4)
+    
+    print(f"\nCluster numbers and proposed keywords saved to '{output_filename}'")
+    return output_filename
+
+def store_embeddings_s3(embeddings, material_type, bucket_name):
+    """Store embeddings in S3 with efficient compression"""
+    s3 = boto3.client('s3')
+    
+    # Convert to float16 for size reduction
+    embeddings_16 = embeddings.astype(np.float16)
+    
+    # Compress in memory
+    buffer = BytesIO()
+    np.savez_compressed(buffer, embeddings=embeddings_16)
+    buffer.seek(0)
+    compressed_data = bz2.compress(buffer.getvalue())
+    
+    # Upload to S3
+    s3_key = f"embeddings/{material_type}/embeddings.npz.bz2"
+    s3.put_object(Bucket=bucket_name, Key=s3_key, Body=compressed_data)
+    
+    return s3_key
+
+# After your clustering is complete in the training notebook:
+# 1. Save cluster keywords for manual editing
+keywords_file = save_cluster_keywords(data_stdp, "Stdp")
+
+# 2. Store embeddings in S3
+s3_bucket = "your-embedding-bucket"
+s3_path = store_embeddings_s3(embeddings, "Stdp", s3_bucket)
+
+# 3. Create metadata file
+metadata = {
+    "material_type": "Stdp",
+    "embedding_path": s3_path,
+    "embedding_bucket": s3_bucket,
+    "model_version": "v1",
+    "training_date": "2024-01-01",
+    "num_samples": len(embeddings)
+}
+
+with open("metadata.json", "w") as f:
+    json.dump(metadata, f)
+
+print("Training completed. Files saved:")
+print(f"- Cluster keywords: {keywords_file}")
+print(f"- Embeddings stored at: s3://{s3_bucket}/{s3_path}")
+print(f"- Metadata: metadata.json")
+```
+
+Updated Inference Code
+
+```python
+# inference.py
+import json
+import boto3
+import numpy as np
+from io import BytesIO
+import bz2
+import pickle
+import os
+
+class MaterialClassifier:
+    def __init__(self):
+        self.s3_client = boto3.client('s3')
+        self.models = {}
+        self.cluster_keywords = {}
+        self.embeddings_cache = {}
+        
+    def load_model(self, material_type):
+        """Load model and cluster keywords for a specific material type"""
+        if material_type in self.models:
+            return self.models[material_type]
+        
+        # Load model
+        model_path = f"{material_type}/model.pkl"
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+        
+        # Load cluster keywords (manually edited JSON)
+        keywords_path = f"{material_type}/cluster_keywords.json"
+        with open(keywords_path, 'r') as f:
+            cluster_keywords = json.load(f)
+        
+        # Load metadata
+        with open(f"{material_type}/metadata.json", 'r') as f:
+            metadata = json.load(f)
+            
+        self.models[material_type] = {
+            "model": model,
+            "cluster_keywords": cluster_keywords,
+            "metadata": metadata
+        }
+        
+        return self.models[material_type]
+    
+    def load_embeddings(self, material_type):
+        """Load embeddings from S3 with caching"""
+        if material_type in self.embeddings_cache:
+            return self.embeddings_cache[material_type]
+        
+        model_info = self.load_model(material_type)
+        metadata = model_info["metadata"]
+        
+        # Download from S3
+        try:
+            response = self.s3_client.get_object(
+                Bucket=metadata["embedding_bucket"],
+                Key=metadata["embedding_path"]
+            )
+            compressed_data = response['Body'].read()
+            
+            # Decompress
+            decompressed_data = bz2.decompress(compressed_data)
+            buffer = BytesIO(decompressed_data)
+            
+            # Load numpy array
+            data = np.load(buffer)
+            embeddings = data['embeddings'].astype(np.float32)  # Convert back to float32
+            
+            # Cache for future use
+            self.embeddings_cache[material_type] = embeddings
+            return embeddings
+            
+        except Exception as e:
+            print(f"Error loading embeddings for {material_type}: {str(e)}")
+            raise
+    
+    def predict(self, material_type, descriptions):
+        """Main prediction method"""
+        # Load model, cluster keywords, and embeddings
+        model_info = self.load_model(material_type)
+        embeddings = self.load_embeddings(material_type)
+        cluster_keywords = model_info["cluster_keywords"]
+        
+        # Your existing prediction logic
+        # Generate embeddings for input descriptions
+        # Compare with stored embeddings to find closest clusters
+        # Map cluster IDs to final names using cluster_keywords
+        
+        # Example pseudocode:
+        # input_embeddings = model.encode(descriptions)
+        # similarities = cosine_similarity(input_embeddings, embeddings)
+        # cluster_ids = np.argmax(similarities, axis=1)
+        # final_names = [cluster_keywords[str(cluster_id)] for cluster_id in cluster_ids]
+        
+        return final_names
+
+# Initialize the classifier
+classifier = MaterialClassifier()
+
+def handler(event, context):
+    """AWS Lambda handler or SageMaker endpoint handler"""
+    material_type = event['material_type']
+    descriptions = event['descriptions']
+    
+    return classifier.predict(material_type, descriptions)
+```
+
+Deployment Configuration
+
+```python
+# model.ipynb - AWS deployment setup
+import boto3
+import tarfile
+import sagemaker
+from sagemaker import Model
+
+# Create deployment package (excluding embeddings)
+with tarfile.open('model.tar.gz', 'w:gz') as tar:
+    tar.add('deployment_package', arcname='code')
+    
+# Upload to S3
+s3 = boto3.client('s3')
+s3.upload_file('model.tar.gz', 'your-deployment-bucket', 'models/model.tar.gz')
+
+# Create SageMaker model
+sagemaker_model = Model(
+    model_data='s3://your-deployment-bucket/models/model.tar.gz',
+    role='your-sagemaker-role',
+    image_uri='your-custom-inference-image-uri',
+    source_dir='code',
+    entry_point='inference.py'
+)
+
+# Deploy endpoint
+predictor = sagemaker_model.deploy(
+    initial_instance_count=1,
+    instance_type='ml.m5.xlarge'
+)
+```
+
+Workflow for Your Team
+
+1. Training Phase:
+   · Run training for each material type
+   · JSON files with auto-generated cluster names are created
+   · Embeddings are stored in S3
+   · Metadata files are created with S3 paths
+2. Manual Editing Phase:
+   · Domain experts edit the JSON files to apply industrial nomenclature
+   · Edited JSON files are placed in the deployment package
+3. Deployment Phase:
+   · Deployment package (models + JSON files) is created
+   · Package is deployed to SageMaker
+   · Embeddings are loaded from S3 on demand
+
+Benefits of This Approach
+
+1. Small Deployment Package: No embeddings in the deployment package
+2. Flexible Naming: JSON files allow manual editing of cluster names
+3. Efficient Storage: Embeddings stored in S3 with compression
+4. Good Performance: Caching ensures embeddings are loaded only once
+5. Cost Effective: S3 storage is cheaper than instance storage
+
+This solution maintains your team's workflow for manual cluster naming while addressing the embedding storage challenge in a production-ready way.
