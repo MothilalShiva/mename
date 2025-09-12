@@ -1,0 +1,341 @@
+For production systems, we prioritize:
+
+1. Fast decompression (low latency)
+2. Good compression ratio
+3. Reasonable compression speed (though this matters less than decompression)
+
+Performance Comparison of Compression Algorithms
+
+Algorithm Compression Ratio Compression Speed Decompression Speed CPU Usage
+bz2 High Slow Slow High
+gzip Medium Medium Medium Medium
+lz4 Low-Medium Very Fast Very Fast Low
+zstandard High Fast Very Fast Medium
+
+Optimized Implementation with Faster Compression
+
+I recommend using zstandard (zstd) which provides excellent compression with very fast decompression, making it ideal for production.
+
+1. Updated Requirements
+
+Add to your requirements.txt:
+
+```
+zstandard
+s3fs
+```
+
+2. Optimized Embedding Storage Class
+
+```python
+import zstandard as zstd
+import numpy as np
+import boto3
+import json
+import os
+from io import BytesIO
+import time
+
+class OptimizedEmbeddingStorage:
+    def __init__(self, s3_bucket="your-embedding-bucket", compression_level=3):
+        self.s3_bucket = s3_bucket
+        self.s3_client = boto3.client('s3')
+        self.compression_level = compression_level
+        self.local_cache_dir = "/tmp/embedding_cache"
+        os.makedirs(self.local_cache_dir, exist_ok=True)
+        
+        # Initialize zstandard compressor and decompressor
+        self.compressor = zstd.ZstdCompressor(level=compression_level)
+        self.decompressor = zstd.ZstdDecompressor()
+    
+    def store_embeddings(self, embeddings, material_type, version="v1"):
+        """Store embeddings with zstandard compression"""
+        # Convert to float16 for size reduction
+        embeddings_16 = embeddings.astype(np.float16)
+        
+        # Serialize to bytes
+        buffer = BytesIO()
+        np.save(buffer, embeddings_16)
+        serialized_data = buffer.getvalue()
+        
+        # Compress with zstandard
+        compressed_data = self.compressor.compress(serialized_data)
+        
+        # Store in S3
+        s3_key = f"embeddings/{material_type}/{version}/embeddings.npy.zst"
+        self.s3_client.put_object(
+            Bucket=self.s3_bucket,
+            Key=s3_key,
+            Body=compressed_data,
+            Metadata={
+                "material_type": material_type,
+                "version": version,
+                "dimensions": f"{embeddings_16.shape}",
+                "dtype": "float16",
+                "compression": "zstandard",
+                "compression_level": str(self.compression_level)
+            }
+        )
+        
+        # Calculate and log compression stats
+        orig_size = len(serialized_data)
+        comp_size = len(compressed_data)
+        ratio = comp_size / orig_size
+        print(f"Compression: {orig_size/1024/1024:.2f}MB → {comp_size/1024/1024:.2f}MB ({ratio:.2%})")
+        
+        return s3_key
+    
+    def load_embeddings(self, material_type, version="v1", use_cache=True):
+        """Load embeddings with fast decompression and caching"""
+        cache_path = f"{self.local_cache_dir}/{material_type}_{version}.npy"
+        
+        # Check local cache first (much faster than S3 + decompression)
+        if use_cache and os.path.exists(cache_path):
+            print(f"Loading {material_type} embeddings from cache")
+            return np.load(cache_path)
+        
+        # Download from S3
+        s3_key = f"embeddings/{material_type}/{version}/embeddings.npy.zst"
+        
+        try:
+            start_time = time.time()
+            response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
+            compressed_data = response['Body'].read()
+            download_time = time.time() - start_time
+            
+            # Decompress
+            start_time = time.time()
+            decompressed_data = self.decompressor.decompress(compressed_data)
+            decompress_time = time.time() - start_time
+            
+            # Load numpy array
+            buffer = BytesIO(decompressed_data)
+            embeddings = np.load(buffer).astype(np.float32)  # Convert back to float32
+            
+            # Cache for future use
+            if use_cache:
+                np.save(cache_path, embeddings)
+            
+            print(f"Download: {download_time:.2f}s, Decompress: {decompress_time:.2f}s")
+            return embeddings
+            
+        except Exception as e:
+            print(f"Error loading embeddings for {material_type}: {str(e)}")
+            raise
+    
+    # Alternative: Even faster option with lz4
+    def store_embeddings_lz4(self, embeddings, material_type, version="v1"):
+        """Store embeddings with lz4 compression (fastest option)"""
+        try:
+            import lz4.frame
+        except ImportError:
+            print("lz4 not installed. Please install with: pip install lz4")
+            return self.store_embeddings(embeddings, material_type, version)
+        
+        # Convert to float16
+        embeddings_16 = embeddings.astype(np.float16)
+        
+        # Serialize to bytes
+        buffer = BytesIO()
+        np.save(buffer, embeddings_16)
+        serialized_data = buffer.getvalue()
+        
+        # Compress with lz4
+        compressed_data = lz4.frame.compress(serialized_data)
+        
+        # Store in S3
+        s3_key = f"embeddings/{material_type}/{version}/embeddings.npy.lz4"
+        self.s3_client.put_object(
+            Bucket=self.s3_bucket,
+            Key=s3_key,
+            Body=compressed_data,
+            Metadata={
+                "material_type": material_type,
+                "version": version,
+                "dimensions": f"{embeddings_16.shape}",
+                "dtype": "float16",
+                "compression": "lz4"
+            }
+        )
+        
+        return s3_key
+    
+    def load_embeddings_lz4(self, material_type, version="v1", use_cache=True):
+        """Load embeddings with lz4 decompression (fastest option)"""
+        try:
+            import lz4.frame
+        except ImportError:
+            print("lz4 not installed. Please install with: pip install lz4")
+            return self.load_embeddings(material_type, version, use_cache)
+        
+        cache_path = f"{self.local_cache_dir}/{material_type}_{version}.npy"
+        
+        if use_cache and os.path.exists(cache_path):
+            print(f"Loading {material_type} embeddings from cache")
+            return np.load(cache_path)
+        
+        s3_key = f"embeddings/{material_type}/{version}/embeddings.npy.lz4"
+        
+        try:
+            start_time = time.time()
+            response = self.s3_client.get_object(Bucket=self.s3_bucket, Key=s3_key)
+            compressed_data = response['Body'].read()
+            download_time = time.time() - start_time
+            
+            # Decompress with lz4
+            start_time = time.time()
+            decompressed_data = lz4.frame.decompress(compressed_data)
+            decompress_time = time.time() - start_time
+            
+            # Load numpy array
+            buffer = BytesIO(decompressed_data)
+            embeddings = np.load(buffer).astype(np.float32)
+            
+            if use_cache:
+                np.save(cache_path, embeddings)
+            
+            print(f"Download: {download_time:.2f}s, Decompress: {decompress_time:.2f}s")
+            return embeddings
+            
+        except Exception as e:
+            print(f"Error loading embeddings for {material_type}: {str(e)}")
+            raise
+```
+
+3. Updated Training Code
+
+```python
+# In your training notebook
+def train_material_model():
+    # Your existing training code
+    
+    # After generating embeddings
+    storage = OptimizedEmbeddingStorage()
+    
+    # Choose compression method based on your needs:
+    # Option 1: zstandard (good balance)
+    s3_path = storage.store_embeddings(embeddings, "Fin")
+    
+    # Option 2: lz4 (fastest)
+    # s3_path = storage.store_embeddings_lz4(embeddings, "Fin")
+    
+    # Save cluster keywords to JSON (for manual editing)
+    cluster_keywords = data_fin[['cluster', 'proposedkey']].drop_duplicates().set_index('cluster')['proposedkey'].to_dict()
+    
+    with open('cluster_keywords.json', 'w') as f:
+        json.dump(cluster_keywords, f, indent=4)
+    
+    # Create metadata
+    metadata = {
+        "material_type": "Fin",
+        "embedding_path": s3_path,
+        "embedding_bucket": "your-embedding-bucket",
+        "compression_method": "zstandard",  # or "lz4"
+        "model_version": "v1",
+        "training_date": "2024-01-01",
+        "num_samples": len(embeddings)
+    }
+    
+    with open("metadata.json", "w") as f:
+        json.dump(metadata, f)
+```
+
+4. Updated Inference Code
+
+```python
+# inference.py
+class MaterialClassifier:
+    def __init__(self):
+        self.storage = OptimizedEmbeddingStorage()
+        self.models = {}
+        self.cluster_keywords = {}
+        self.embeddings_cache = {}
+        
+    def load_model(self, material_type):
+        """Load model and cluster keywords for a specific material type"""
+        if material_type in self.models:
+            return self.models[material_type]
+        
+        # Load model
+        model_path = f"{material_type}/model.pkl"
+        with open(model_path, 'rb') as f:
+            model = pickle.load(f)
+        
+        # Load cluster keywords (manually edited JSON)
+        keywords_path = f"{material_type}/cluster_keywords.json"
+        with open(keywords_path, 'r') as f:
+            cluster_keywords = json.load(f)
+        
+        # Load metadata
+        with open(f"{material_type}/metadata.json", 'r') as f:
+            metadata = json.load(f)
+            
+        self.models[material_type] = {
+            "model": model,
+            "cluster_keywords": cluster_keywords,
+            "metadata": metadata
+        }
+        
+        return self.models[material_type]
+    
+    def get_embeddings(self, material_type):
+        """Get embeddings with appropriate decompression method"""
+        if material_type in self.embeddings_cache:
+            return self.embeddings_cache[material_type]
+        
+        model_info = self.load_model(material_type)
+        metadata = model_info["metadata"]
+        
+        # Choose decompression method based on metadata
+        compression_method = metadata.get("compression_method", "zstandard")
+        
+        if compression_method == "lz4":
+            embeddings = self.storage.load_embeddings_lz4(material_type)
+        else:  # Default to zstandard
+            embeddings = self.storage.load_embeddings(material_type)
+        
+        self.embeddings_cache[material_type] = embeddings
+        return embeddings
+    
+    def predict(self, material_type, descriptions):
+        """Main prediction method"""
+        # Load model, cluster keywords, and embeddings
+        model_info = self.load_model(material_type)
+        embeddings = self.get_embeddings(material_type)
+        cluster_keywords = model_info["cluster_keywords"]
+        
+        # Your prediction logic here
+        # ...
+        
+        return predictions
+```
+
+Performance Considerations
+
+1. Cold Start vs Warm Start:
+   · Cold start: Download + decompression (few seconds)
+   · Warm start: Cache hit (milliseconds)
+2. Cache Strategy:
+   · Use local disk cache (/tmp in Lambda or SageMaker)
+   · Implement TTL or size-based eviction if needed
+   · Consider using ElastiCache for multi-instance environments
+3. Compression Choice:
+   · Use zstandard for best balance of compression and speed
+   · Use lz4 if decompression speed is critical
+   · Test both with your specific data to make the final decision
+
+Deployment Recommendations
+
+1. Memory Allocation:
+   · Ensure your SageMaker instances have enough memory for cached embeddings
+   · Monitor memory usage in CloudWatch
+2. Monitoring:
+   · Log download and decompression times
+   · Set up CloudWatch alarms for slow operations
+   · Monitor cache hit rates
+3. Cost Optimization:
+   · Use S3 Intelligent-Tiering for embeddings
+   · Consider S3 One Zone-IA for non-critical embeddings
+   · Implement lifecycle policies to archive old versions
+
+This approach gives you the best of both worlds: efficient storage with fast access times. The local caching ensures that after the first load, subsequent requests are extremely fast, making it suitable for production workloads.
